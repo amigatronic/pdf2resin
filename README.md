@@ -10,6 +10,7 @@ A lightweight PySide6 desktop application that converts a single-page vector PDF
 
 This tool is specifically designed for **flat masked-exposure workflows** (PCB exposure, stencils, UV curing masks, resin test patterns) where every layer of the output is the same image repeated *N* times, rather than a sliced 3D model.
 
+![Main Window](screenshots/Main_Window.jpg)
 ---
 
 ## 🛠️ How It Works
