@@ -10,7 +10,7 @@ A lightweight PySide6 desktop application that converts a single-page vector PDF
 
 This tool is specifically designed for **flat masked-exposure workflows** (PCB exposure, stencils, UV curing masks, resin test patterns) where every layer of the output is the same image repeated *N* times, rather than a sliced 3D model.
 
-![Main Window](screenshots/Main_Window.jpg)
+![Main Window](screenshots/monoscope.jpg)
 ---
 
 ## 🛠️ How It Works
@@ -50,7 +50,7 @@ This tool is specifically designed for **flat masked-exposure workflows** (PCB e
 ---
 
 ## 📋 Supported Output Formats & Encoders
-
+![Main Window](screenshots/uvtools_AMY501.jpg)
 | Format | UVtools Strict Encoder | Notes |
 | :--- | :--- | :--- |
 | **SL1** | `sl1` | Written directly. No UVtools call needed. |
@@ -61,9 +61,9 @@ This tool is specifically designed for **flat masked-exposure workflows** (PCB e
 | **PHZ** | `phz` | Phrozen format. |
 
 > ⚠️ **Important:** If you add support for another format, verify the exact strict encoder name by running `UVtoolsCmd convert` with no arguments. It lists all valid encoder names and the extensions each one accepts. Never assume the encoder name matches the file extension.
-
+![Main Window](screenshots/uvtools_monoscope.jpg)
 ---
-
+![Main Window](screenshots/Main_Window.jpg)
 ## 📏 XY Calibration (Crucial for Photolithography)
 
 This tool computes pixel sizes from the *nominal* display dimensions of your printer (from the preset or your custom values). It **cannot** know:
@@ -81,6 +81,7 @@ The included `calibration_pattern.pdf` exists to measure and correct that offset
 6. Repeat whenever you change resin brand or exposure profile, since light-bleed compensation is resin- and settings-dependent.
 
 ---
+![Main Window](screenshots/AMY501.jpg)
 
 ## ⚠️ Known Limitations
 
