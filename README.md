@@ -100,4 +100,4 @@ See the [LICENSE](LICENSE) file for details.
 
 ## 🤝 Contributing
 
-Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/your-username/pdf2resin/issues).
+Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/amigatronic/pdf2resin/issues).
