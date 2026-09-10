@@ -125,4 +125,5 @@ Contributions, issues, and feature requests are welcome! Feel free to check the 
 
 ## 🙏 Acknowledgments
 
-- Special thanks to [sn4k3](https://github.com/sn4k3) and the [UVtools](https://github.com/sn4k3/UVtools)
+- Special thanks to [sn4k3](https://github.com/sn4k3) and the [UVtools](https://github.com/sn4k3/UVtools) project for making multi-format slicer file conversion possible.
+- Thanks to the [Poppler](https://gitlab.freedesktop.org/poppler/poppler) project for `pdftoppm`, used for high-resolution PDF rasterization.
