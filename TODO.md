@@ -75,3 +75,26 @@ PDF→PNG rasterization (`pdf_to_highres_pil`) as the first stage.
 - [ ] Update `README.md`'s "Known Limitations" section once this ships,
       since "identical layers only / does not slice a 3D model" will no
       longer be accurate for this mode.
+
+## 3. Linux: detect UVtools when installed as an AppImage
+
+Low priority — suggested by sn4k3 (UVtools author) in
+[UVtools#1144](https://github.com/sn4k3/UVtools/discussions/1144). Not a
+priority for the maintainer, who doesn't use Linux; leaving it documented
+here for anyone who wants to pick it up.
+
+`find_executable()` already covers Windows (PATH + registry + common
+install dirs) and macOS (`/Applications/UVtools.app/Contents/MacOS`)
+correctly. On Linux it only looks for a binary literally named
+`UVtoolsCmd` in `~/.local/bin`, `/usr/local/bin`, `/usr/bin` — it does not
+account for UVtools being distributed as a version-named AppImage
+(e.g. `UVtools-v5.x.x.AppImage`), which is the common install method on
+Linux.
+
+- [ ] Glob for `UVtools*.AppImage` in common locations (`~`,
+      `~/Applications`, `~/Downloads`, `/opt`, ...).
+- [ ] Confirm how the CLI is actually invoked from an AppImage (whether
+      `UVtoolsCmd`-equivalent functionality is reachable by passing
+      `convert`-style arguments directly to the AppImage, or whether it
+      needs to be extracted/mounted first) before wiring it into
+      `find_executable()`.
