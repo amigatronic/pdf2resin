@@ -1014,7 +1014,7 @@ class PDF2ResinGUI(QMainWindow):
                 self.crop_box = None
         self.preview_label.set_crop_enabled(self.crop_check.isChecked())
 
-        self.log("PDF2Resin v1.3.3 started.")
+        self.log("PDF2Resin v1.3.4 started.")
 
         # Auto-size the window tall enough to show every control, including
         # the log panel, without the right-hand panel needing to scroll.
