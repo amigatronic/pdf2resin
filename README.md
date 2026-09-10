@@ -122,3 +122,7 @@ See the [LICENSE](LICENSE) file for details.
 ## 🤝 Contributing
 
 Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/amigatronic/pdf2resin/issues). Planned work is tracked in `TODO.md`.
+
+## 🙏 Acknowledgments
+
+- Special thanks to [sn4k3](https://github.com/sn4k3) and the [UVtools](https://github.com/sn4k3/UVtools
