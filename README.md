@@ -125,4 +125,4 @@ Contributions, issues, and feature requests are welcome! Feel free to check the 
 
 ## 🙏 Acknowledgments
 
-- Special thanks to [sn4k3](https://github.com/sn4k3) and the [UVtools](https://github.com/sn4k3/UVtools
+- Special thanks to [sn4k3](https://github.com/sn4k3) and the [UVtools](https://github.com/sn4k3/UVtools)
