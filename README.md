@@ -82,7 +82,7 @@ This tool is specifically designed for **flat masked-exposure workflows** (PCB e
 
 ---
 
-![Main Window, full](screenshots/Main_Window.jpg) screenshots/snapshot_landscape_cyan.jpg
+![Main Window, full](screenshots/Main_Window.jpg) 
 ![Main Window, full](screenshots/snapshot_landscape_cyan.jpg)
 ## 📏 XY Calibration (Crucial for Photolithography)
 
