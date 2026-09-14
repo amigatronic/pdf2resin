@@ -25,6 +25,8 @@ This tool is specifically designed for **flat masked-exposure workflows** (PCB e
   default behind a `▸ Crop` toggle, keeping the UI uncluttered when those
   options aren't needed for a given job.
 
+![Main Window](screenshots/snapshot_landscape.jpg) 
+
 ## 🛠️ How It Works
 
 1. **High-Resolution Rasterization**: Renders the first page of the input PDF to a high-resolution raster image using `pdftoppm` (from Poppler). The rendering DPI is dynamically calculated based on the target printer's pixel density to prevent aliasing.
