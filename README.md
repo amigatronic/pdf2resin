@@ -105,6 +105,7 @@ The included `calibration_pattern.pdf` exists to measure and correct that offset
 ---
 
 ![Main Window, AMY501](screenshots/AMY501.jpg)
+![Main Window, AMY501](screenshots/landscape_uvtools.jpg)
 
 ## ⚠️ Known Limitations
 
