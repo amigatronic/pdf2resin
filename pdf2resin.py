@@ -16,6 +16,7 @@ Both tool paths can be located automatically on first launch (see
 find_executable) or set manually via the "Choose app..." buttons.
 """
 
+import re
 import sys
 import zipfile
 import subprocess
@@ -78,10 +79,10 @@ PRESET_FORMAT_MAP = {
 # relying on internal encoder names that may change between UVtools versions.
 FORMAT_TO_UVTOOLS_ENCODER = {
     "SL1": "sl1",
-    "CTB": "ctb",
-    "PHOTON": "photon",
-    "GOO": "goo",
-    "CBDDLP": "cbddlp",
+    "CTB": "chitubox",
+    "PHOTON": "chitubox",
+    "GOO": "goov5",
+    "CBDDLP": "chitubox",
     "PHZ": "phz"
 }
 
@@ -166,9 +167,22 @@ def find_executable(name: str, win_reg_key: str = None) -> str:
 
     return ""
 
+def measure_pdf_page_size_inches(pdf_path: str, pdftoppm_exe: str, probe_dpi: int = 150) -> tuple:
+    """Render the PDF at a small, always-safe DPI purely to measure its
+    physical page size in inches, without needing a separate pdfinfo
+    dependency. Returns None if the probe render itself fails."""
+    try:
+        img = pdf_to_highres_pil(pdf_path, pdftoppm_exe, dpi=probe_dpi)
+        return img.width / probe_dpi, img.height / probe_dpi
+    except Exception:
+        return None
+
+
+
+
 
 def calculate_render_dpi(res_x: int, res_y: int, disp_w: float, disp_h: float,
-                         min_dpi: int = 1200) -> int:
+                         min_dpi: int = 1200, page_size_in: tuple = None) -> int:
     """Compute the DPI to use when rasterizing the source PDF, scaled to the
     target printer's pixel density.
 
@@ -181,13 +195,21 @@ def calculate_render_dpi(res_x: int, res_y: int, disp_w: float, disp_h: float,
 
     The target DPI is set to twice the printer's native pixel density,
     which leaves enough headroom for a clean high-quality downscale.
-    A floor of `min_dpi` is always enforced.
+    A floor of `min_dpi` is used unless the page-size safety cap requires a lower value.
     """
     ppm_x = res_x / disp_w
     ppm_y = res_y / disp_h
     max_ppm = max(ppm_x, ppm_y)
-    target_dpi = int(max_ppm * 25.4 * 2)
-    return max(min_dpi, target_dpi)
+    target_dpi = max(min_dpi, int(max_ppm * 25.4 * 2))
+    if page_size_in:
+        page_w_in, page_h_in = page_size_in
+        max_dim_in = max(page_w_in, page_h_in)
+        if max_dim_in > 0:
+            safe_max_dpi = max(1, int(32000 / max_dim_in))  # Cairo limit = 32000
+            # Apply the safety cap after the minimum DPI. If the safe cap is
+            # below min_dpi, safety takes precedence over the quality floor.
+            target_dpi = min(target_dpi, safe_max_dpi)
+    return max(1, target_dpi)
 
 
 def pdf_to_highres_pil(pdf_path: str, pdftoppm_exe: str, dpi: int = 1200) -> Image.Image:
@@ -204,6 +226,13 @@ def pdf_to_highres_pil(pdf_path: str, pdftoppm_exe: str, dpi: int = 1200) -> Ima
         if result.returncode != 0 or not temp_png.exists():
             raise RuntimeError(f"pdftoppm failed: {result.stderr}")
         img = Image.open(temp_png).convert("RGB")
+        if img.width < 10 or img.height < 10:
+            raise RuntimeError(
+                f"pdftoppm produced a degenerate {img.width}x{img.height}px image. "
+                f"This usually means the requested DPI ({dpi}) makes the page exceed "
+                f"Poppler/Cairo's ~32767px-per-side limit. Try a lower-density printer "
+                f"preset or a smaller page size."
+            )
         return img
     finally:
         temp_png.unlink(missing_ok=True)
@@ -390,8 +419,9 @@ class CropPreviewLabel(QLabel):
 
     def set_crop_rect(self, rect):
         self.crop_rect = QRect(rect) if rect is not None else None
+        # update() lets Qt coalesce rapid repaints; repaint() would force a
+        # synchronous paint on every crop change.
         self.update()
-        self.repaint()
 
     def set_crop_enabled(self, enabled: bool):
         self.crop_enabled = enabled
@@ -644,6 +674,8 @@ class PDF2ResinGUI(QMainWindow):
         self.settings = QSettings("PDF2Resin", "PDF2Resin")
 
         self.original_image = None
+        self._preview_full_image = None
+        self._preview_full_size = None
         self.pdf_path = None
         self.render_dpi = None  # DPI actually used to rasterize original_image, set by load_pdf()
         self.log_file_path = Path(__file__).resolve().parent / "pdf2resin.log"
@@ -653,6 +685,7 @@ class PDF2ResinGUI(QMainWindow):
             'color_target': 'Red', 'color_tolerance': 50
         }
         self.crop_box = None  # Normalized source-image coordinates: (x0, y0, x1, y1)
+        self.preview_fit_crop = False  # Preview-only zoom; never changes export geometry
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -775,6 +808,22 @@ class PDF2ResinGUI(QMainWindow):
         self.crop_reset_btn.clicked.connect(self.reset_crop)
         self.crop_reset_btn.setEnabled(self.crop_check.isChecked())
         crop_layout.addWidget(self.crop_reset_btn)
+
+        self.fit_crop_btn = QPushButton("Fit Crop")
+        self.fit_crop_btn.setToolTip(
+            "Zoom the preview to the selected crop without changing the export."
+        )
+        self.fit_crop_btn.clicked.connect(self.fit_crop_preview)
+        self.fit_crop_btn.setEnabled(False)
+        crop_layout.addWidget(self.fit_crop_btn)
+
+        self.fit_page_btn = QPushButton("Fit Page")
+        self.fit_page_btn.setToolTip(
+            "Return the preview to the full PDF page."
+        )
+        self.fit_page_btn.clicked.connect(self.fit_page_preview)
+        crop_layout.addWidget(self.fit_page_btn)
+
         crop_section_layout.addLayout(crop_layout)
 
         self.crop_label = QLabel("Crop: Full Image")
@@ -981,6 +1030,7 @@ class PDF2ResinGUI(QMainWindow):
         self.scale_slider.setValue(saved_scale)
         
         saved_rotation = int(self.settings.value("rotation", 0))
+        self.current_transforms['rotate'] = saved_rotation
         if saved_rotation == 90:
             self.rot_90.setChecked(True)
         elif saved_rotation == 180:
@@ -1307,10 +1357,19 @@ class PDF2ResinGUI(QMainWindow):
         if x1 - x0 < 0.005 or y1 - y0 < 0.005:
             return
 
+        # Crop editing always happens on the full-page preview.
+        if self.preview_fit_crop:
+            self.preview_fit_crop = False
         self.crop_box = crop
         self.crop_check.setChecked(True)
         self.crop_reset_btn.setEnabled(True)
-        self.update_preview()
+        self.fit_crop_btn.setEnabled(True)
+
+        # During mouse dragging the crop overlay is already painted directly by
+        # CropPreviewLabel. Do not rebuild the high-resolution preview on every
+        # mouse move. Refresh only when the drag is finished.
+        if finished:
+            self.update_preview()
 
     def on_crop_section_toggled(self, expanded):
         """Fold/unfold the crop controls panel. Purely a UI visibility
@@ -1322,12 +1381,31 @@ class PDF2ResinGUI(QMainWindow):
         """Enable or disable the crop overlay without changing the stored selection."""
         self.preview_label.set_crop_enabled(enabled)
         self.crop_reset_btn.setEnabled(enabled)
+        if not enabled:
+            self.preview_fit_crop = False
+        self.fit_crop_btn.setEnabled(bool(enabled and self.crop_box))
         self.update_preview()
 
     def reset_crop(self):
         """Reset the crop to the full source image."""
         self.crop_box = None
+        self.preview_fit_crop = False
+        self._preview_full_image = None
+        self._preview_full_size = None
+        self.fit_crop_btn.setEnabled(False)
         self.crop_check.setChecked(True)
+        self.update_preview()
+
+    def fit_crop_preview(self):
+        """Zoom the preview to the selected crop; export geometry is unchanged."""
+        if not self.original_image or not self.crop_box:
+            return
+        self.preview_fit_crop = True
+        self.update_preview()
+
+    def fit_page_preview(self):
+        """Return the preview to the full source page."""
+        self.preview_fit_crop = False
         self.update_preview()
 
     def on_transform_change(self):
@@ -1377,12 +1455,32 @@ class PDF2ResinGUI(QMainWindow):
         max_w = max(1, ui_size.width() - 40)
         max_h = max(1, ui_size.height() - 40)
 
-        preview_img = self.original_image.copy()
-        preview_img.thumbnail((max_w, max_h), Image.Resampling.BILINEAR)
+        # Preview-only zoom: crop the source before thumbnailing so the selected
+        # area fills the available preview. This never changes crop_box or export
+        # geometry. While editing a crop, preview_fit_crop is disabled so the full
+        # page remains visible and interactive.
+        if self.preview_fit_crop and self.crop_box is not None:
+            preview_img = self.original_image.copy()
+            x0, y0, x1, y1 = self.crop_box
+            crop_left = max(0, min(preview_img.width - 1, int(round(x0 * preview_img.width))))
+            crop_top = max(0, min(preview_img.height - 1, int(round(y0 * preview_img.height))))
+            crop_right = max(crop_left + 1, min(preview_img.width, int(round(x1 * preview_img.width))))
+            crop_bottom = max(crop_top + 1, min(preview_img.height, int(round(y1 * preview_img.height))))
+            preview_img = preview_img.crop((crop_left, crop_top, crop_right, crop_bottom))
+            preview_img.thumbnail((max_w, max_h), Image.Resampling.BILINEAR)
+        else:
+            # Cache the expensive full-page thumbnail. This avoids repeatedly
+            # resampling a potentially 20K-30K pixel source image.
+            cache_size = (max_w, max_h)
+            if (self._preview_full_image is None
+                    or self._preview_full_size != cache_size):
+                preview_img = self.original_image.copy()
+                preview_img.thumbnail(cache_size, Image.Resampling.BILINEAR)
+                self._preview_full_image = preview_img
+                self._preview_full_size = cache_size
+            preview_img = self._preview_full_image.copy()
 
         # Apply transformations to the small thumbnail (lightning fast).
-        # Crop is intentionally not applied here: the full source remains
-        # visible so the user can position the crop interactively.
         preview_img = apply_transforms(preview_img, **self.current_transforms)
 
         q_img = QImage(
@@ -1401,7 +1499,8 @@ class PDF2ResinGUI(QMainWindow):
         self.preview_label.set_image_rect(image_rect)
         self.preview_label.set_aspect_ratio(self.get_crop_aspect_ratio())
 
-        if self.crop_check.isChecked() and self.crop_box is not None:
+        if (self.crop_check.isChecked() and self.crop_box is not None
+                and not self.preview_fit_crop):
             self.preview_label.set_crop_rect(self._source_crop_to_preview_rect())
         else:
             self.preview_label.set_crop_rect(None)
@@ -1412,6 +1511,27 @@ class PDF2ResinGUI(QMainWindow):
             "background: #1e1e1e; border: 2px solid #007acc;"
         )
 
+    def _sync_transform_state_from_ui(self):
+        """Synchronize transform state from the controls even before an image exists."""
+        self.current_transforms['scale'] = self.scale_slider.value() / 100.0
+        for btn in [self.rot_0, self.rot_90, self.rot_180, self.rot_270]:
+            if btn.isChecked():
+                self.current_transforms['rotate'] = int(btn.text().replace("°", ""))
+                break
+        self.current_transforms['flip_h'] = self.flip_h_check.isChecked()
+        self.current_transforms['flip_v'] = self.flip_v_check.isChecked()
+        self.current_transforms['invert'] = self.invert_check.isChecked()
+
+        if self.none_radio.isChecked():
+            self.current_transforms['filter_mode'] = 'none'
+        elif self.bw_radio.isChecked():
+            self.current_transforms['filter_mode'] = 'bw'
+            self.current_transforms['bw_threshold'] = self.filter_slider.value()
+        else:
+            self.current_transforms['filter_mode'] = 'color'
+            self.current_transforms['color_target'] = self.color_target_combo.currentText()
+            self.current_transforms['color_tolerance'] = self.filter_slider.value()
+
     def load_pdf(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select PDF", "", "PDF Files (*.pdf)")
         if not path:
@@ -1419,11 +1539,18 @@ class PDF2ResinGUI(QMainWindow):
 
         self.pdf_path = path
 
-        # A new source PDF starts with no crop selection. The user can draw
-        # a new crop directly on the preview after the PDF has been rendered.
+        # A new source PDF starts from the original image state: no crop and no
+        # filter. Transformations such as rotation/scale are still preserved.
         self.crop_box = None
+        self.preview_fit_crop = False
+        self.fit_crop_btn.setEnabled(False)
         if self.crop_check.isChecked():
             self.crop_label.setText("Crop: Draw a rectangle on the preview")
+
+        # A newly loaded PDF is always shown as the original rasterized page.
+        # The user can explicitly enable B/W or Color Filter afterwards.
+        self.none_radio.setChecked(True)
+        self._sync_transform_state_from_ui()
 
         self.render_loaded_pdf()
 
@@ -1432,20 +1559,56 @@ class PDF2ResinGUI(QMainWindow):
         if not self.pdf_path:
             return False
 
+        # Large PDFs can take seconds to rasterize. Process pending paint events
+        # before entering the blocking subprocess so the wait cursor and button
+        # text are actually visible to the user.
+        self.load_pdf_btn.setEnabled(False)
+        self.load_pdf_btn.setText("Loading PDF...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            return self._render_loaded_pdf_impl()
+        finally:
+            if QApplication.overrideCursor() is not None:
+                QApplication.restoreOverrideCursor()
+            self.load_pdf_btn.setText("Load PDF")
+            self.load_pdf_btn.setEnabled(True)
+
+    def _render_loaded_pdf_impl(self):
+        """Internal PDF rendering implementation; caller owns busy-state cleanup."""
         pdftoppm = self.pdftoppm_path.text()
         if not pdftoppm or not Path(pdftoppm).exists():
             self.log("Load aborted: pdftoppm not configured.", level="ERROR")
             return False
 
+        self._sync_transform_state_from_ui()
+
         # Rasterize at a DPI scaled to the currently selected printer's
         # pixel density, so the source is always sampled finely enough
         # regardless of which preset is active.
+        page_size = measure_pdf_page_size_inches(self.pdf_path, pdftoppm)
+        if page_size is None:
+            self.log(
+                "Load aborted: unable to determine the PDF page size; "
+                "refusing to render without the safety DPI cap.",
+                level="ERROR"
+            )
+            return False
+
         render_dpi = calculate_render_dpi(
             self.res_x_spin.value(), self.res_y_spin.value(),
-            self.disp_w_spin.value(), self.disp_h_spin.value()
+            self.disp_w_spin.value(), self.disp_h_spin.value(),
+            page_size_in=page_size
         )
 
         try:
+            # Do not leave the previous PDF visible if this load fails.
+            self.original_image = None
+            self._preview_full_image = None
+            self._preview_full_size = None
+            self.convert_btn.setEnabled(False)
+            self.preview_label.clear()
+            self.preview_label.setText("Loading PDF...")
             self.original_image = pdf_to_highres_pil(
                 self.pdf_path, pdftoppm, dpi=render_dpi
             )
@@ -1487,11 +1650,95 @@ class PDF2ResinGUI(QMainWindow):
         else:
             self.log(f"UVtools.exe not found next to UVtoolsCmd.exe at: {cmd_path.parent}", level="WARN")
 
+    def _export_pixel_size(self):
+        """Return the actual intended output dimensions in printer pixels."""
+        if not self.original_image or not self.render_dpi:
+            return None
+
+        res_x = self.res_x_spin.value()
+        res_y = self.res_y_spin.value()
+        disp_w = self.disp_w_spin.value()
+        disp_h = self.disp_h_spin.value()
+
+        pdf_width_mm = self.original_image.width * 25.4 / self.render_dpi
+        pdf_height_mm = self.original_image.height * 25.4 / self.render_dpi
+
+        if self.crop_check.isChecked() and self.crop_box is not None:
+            x0, y0, x1, y1 = self.crop_box
+            left = max(0, min(self.original_image.width - 1,
+                              int(round(x0 * self.original_image.width))))
+            top = max(0, min(self.original_image.height - 1,
+                             int(round(y0 * self.original_image.height))))
+            right = max(left + 1, min(self.original_image.width,
+                                      int(round(x1 * self.original_image.width))))
+            bottom = max(top + 1, min(self.original_image.height,
+                                      int(round(y1 * self.original_image.height))))
+            pdf_width_mm = (right - left) * 25.4 / self.render_dpi
+            pdf_height_mm = (bottom - top) * 25.4 / self.render_dpi
+
+        if self.current_transforms['rotate'] in (90, 270):
+            pdf_width_mm, pdf_height_mm = pdf_height_mm, pdf_width_mm
+
+        scale = self.current_transforms['scale']
+        target_w = max(1, int(pdf_width_mm * scale * res_x / disp_w))
+        target_h = max(1, int(pdf_height_mm * scale * res_y / disp_h))
+
+        if target_w > res_x or target_h > res_y:
+            fit_ratio = min(res_x / target_w, res_y / target_h)
+            target_w = max(1, int(target_w * fit_ratio))
+            target_h = max(1, int(target_h * fit_ratio))
+
+        return target_w, target_h
+
+    def _build_export_filename(self):
+        """Build a compact filename describing the generated printer file."""
+        stem = Path(self.pdf_path).stem
+
+        # Printer preset: e.g. ElegooSaturn3_12K, PhrozenSonicMini_8K.
+        preset = self.preset_combo.currentText()
+        # Keep printer names compact/readable in filenames:
+        # "Elegoo Saturn 3 (12K)" -> "ElegooSaturn3_12K".
+        preset_slug = re.sub(r'\s+', '', preset)
+        preset_slug = preset_slug.replace('(', '_').replace(')', '')
+        preset_slug = re.sub(r'[^A-Za-z0-9_]+', '', preset_slug)
+        preset_slug = re.sub(r'_+', '_', preset_slug).strip('_')
+
+        parts = [stem]
+
+        size = self._export_pixel_size()
+        if self.crop_check.isChecked() and size:
+            parts.append(f"crop{size[0]}x{size[1]}")
+
+        if preset_slug:
+            parts.append(preset_slug)
+
+        # Add only non-default transformations so the name stays readable.
+        t = self.current_transforms
+        if t['rotate']:
+            parts.append(f"rot{t['rotate']}")
+        if t['scale'] != 1.0:
+            parts.append(f"scale{t['scale']:.2f}x".replace(".", "p"))
+        if t['flip_h']:
+            parts.append("flipH")
+        if t['flip_v']:
+            parts.append("flipV")
+        if t['invert']:
+            parts.append("invert")
+
+        if t['filter_mode'] == 'bw':
+            parts.append(f"bw{t['bw_threshold']}")
+        elif t['filter_mode'] == 'color':
+            color_slug = re.sub(r'[^A-Za-z0-9]+', '', str(t['color_target']))
+            parts.append(f"color{color_slug}{t['color_tolerance']}")
+
+        ext = self.format_combo.currentText().lower()
+        return "_".join(parts) + f".{ext}"
+
     def convert(self):
         if not self.convert_btn.isEnabled() or not self.original_image:
             return
 
-        default_name = Path(self.pdf_path).stem + f".{self.format_combo.currentText().lower()}"
+        default_name = self._build_export_filename()
         default_dir = str(Path(self.pdf_path).parent / default_name)
         out_path, _ = QFileDialog.getSaveFileName(
             self, "Save Printer File", default_dir,
@@ -1528,14 +1775,31 @@ class PDF2ResinGUI(QMainWindow):
             printer_ppm_x = res_x / disp_w
             printer_ppm_y = res_y / disp_h
 
-            recommended_dpi = calculate_render_dpi(res_x, res_y, disp_w, disp_h)
-            if self.render_dpi != recommended_dpi:
+            # Reuse the physical page size already known from the loaded
+            # image (no extra probe render needed) so the Cairo-safe DPI
+            # cap is applied here too - otherwise this check compares
+            # against the uncapped ideal DPI and always thinks a correctly
+            # capped render is "wrong", forcing an endless re-render loop.
+            known_page_size_in = (
+                self.original_image.width / self.render_dpi,
+                self.original_image.height / self.render_dpi
+            ) if self.original_image and self.render_dpi else None
+            recommended_dpi = calculate_render_dpi(
+                res_x, res_y, disp_w, disp_h, page_size_in=known_page_size_in
+            )
+            # Two independent measurements of the same physical page size
+            # (one from a low-DPI probe render, one back-derived from the
+            # final render) can legitimately differ by a DPI unit or two
+            # due to rounding - that's not a real quality problem, so allow
+            # a small tolerance instead of demanding exact equality.
+            dpi_tolerance = 5
+            if abs(self.render_dpi - recommended_dpi) > dpi_tolerance:
                 self.log(
                     f"Source render DPI ({self.render_dpi}) does not match the "
                     f"current printer settings ({recommended_dpi}). Re-rendering the PDF.",
                     level="WARN"
                 )
-                if not self.render_loaded_pdf() or self.render_dpi != recommended_dpi:
+                if not self.render_loaded_pdf() or abs(self.render_dpi - recommended_dpi) > dpi_tolerance:
                     raise RuntimeError("PDF source could not be rendered at the current printer DPI.")
 
             pdf_dpi = self.render_dpi
@@ -1557,6 +1821,19 @@ class PDF2ResinGUI(QMainWindow):
 
             target_w_px = int(scaled_width_mm * printer_ppm_x)
             target_h_px = int(scaled_height_mm * printer_ppm_y)
+
+            # If the physical size collapsed to (near) zero before truncation
+            # - e.g. a degenerate crop selection or an unreasonably low scale -
+            # fail loudly instead of silently exporting a useless 1x1px file.
+            if target_w_px < 1 or target_h_px < 1:
+                self.log(
+                    f"Export aborted: computed output size is invalid "
+                    f"({target_w_px}x{target_h_px}px). Check the crop selection and "
+                    f"scale value - the current combination produces a physical size "
+                    f"of approximately {scaled_width_mm:.3f} x {scaled_height_mm:.3f} mm.",
+                    level="ERROR"
+                )
+                return
 
             target_w_px = max(1, target_w_px)
             target_h_px = max(1, target_h_px)
@@ -1582,6 +1859,11 @@ class PDF2ResinGUI(QMainWindow):
                 source_img = source_img.crop(
                     (crop_left, crop_top, crop_right, crop_bottom)
                 )
+                # Use the actual pixel crop (not the idealized normalized
+                # fraction) so physical output size exactly matches the
+                # pixels that will be transformed and exported.
+                pdf_width_mm = source_img.width * 25.4 / pdf_dpi
+                pdf_height_mm = source_img.height * 25.4 / pdf_dpi
 
             # --- BUG #1 & #2 FIX: UNIFIED TRANSFORMATION PIPELINE ---
             # Use the exact same transformation pipeline as the preview to ensure
