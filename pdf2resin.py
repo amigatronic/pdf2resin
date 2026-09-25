@@ -1,9 +1,9 @@
 """
 PDF2Resin — Direct-to-Print Photolithography
-Version: v1.3.4
+Version: v1.3.11
 Converts a single-page vector PDF into a native resin-printer exposure
-file (SL1, CTB, PHOTON, GOO, CBDDLP, PHZ), preserving real physical
-dimensions on the build plate regardless of printer brand or LCD resolution.
+file (SL1, CTB, PHOTON, GOO, CBDDLP, PHZ) or a 3D mesh STL, generated internally from the final exposure mask
+while preserving real physical dimensions on the build plate regardless of printer brand or LCD resolution.
 
 This tool targets flat masked-exposure workflows (photolithography,
 PCB exposure, stencils, UV curing masks) where every output layer is
@@ -17,6 +17,7 @@ find_executable) or set manually via the "Choose app..." buttons.
 """
 
 import re
+import struct
 import sys
 import zipfile
 import subprocess
@@ -40,6 +41,13 @@ try:
     from PySide6.QtGui import QPixmap, QImage, QPainter, QPen
     from PySide6.QtCore import Qt, QSettings, QPoint, QRect
     from PIL import Image, ImageOps
+    from skimage.measure import find_contours
+    from shapely.geometry import Polygon
+    from shapely.ops import triangulate
+    try:
+        from shapely import constrained_delaunay_triangles
+    except ImportError:
+        constrained_delaunay_triangles = None
     # The dynamic render DPI (see calculate_render_dpi) can legitimately
     # produce very large raster images on high-density printer presets
     # (e.g. a 12K printer on an A4-sized PDF renders well above Pillow's
@@ -49,7 +57,7 @@ try:
     Image.MAX_IMAGE_PIXELS = None
 except ImportError as e:
     print(f"Missing dependencies: {e}")
-    print("Install with: pip install PySide6 Pillow numpy")
+    print("Install with: pip install PySide6 Pillow numpy scikit-image shapely")
     sys.exit(1)
 
 # --- PRESETS FOR COMMON RESIN PRINTERS ---
@@ -322,8 +330,15 @@ def build_sl1(png_path: str, out_sl1: str, width_px: int, height_px: int,
               layer_height: float, normal_exp: float, bottom_exp: float,
               bottom_layers: int, num_layers: int) -> None:
     """Generate an SL1 archive with multiple identical layers for photolithography."""
-    actual_bottom_layers = min(bottom_layers, num_layers)
-    actual_normal_layers = max(0, num_layers - actual_bottom_layers)
+    requested_layers = int(num_layers)
+    actual_bottom_layers = min(max(0, int(bottom_layers)), requested_layers)
+    actual_normal_layers = requested_layers - actual_bottom_layers
+    encoded_layer_count = actual_bottom_layers + actual_normal_layers
+    if encoded_layer_count != requested_layers:
+        raise RuntimeError(
+            f"Internal layer-count error: requested {requested_layers}, "
+            f"encoded {encoded_layer_count}."
+        )
     total_time = int(actual_bottom_layers * bottom_exp + actual_normal_layers * normal_exp)
 
     config_ini = f"""action = print
@@ -337,7 +352,7 @@ printer_model = SL1
 exp_time = {normal_exp}
 exp_time_first = {bottom_exp}
 """
-    for i in range(num_layers):
+    for i in range(requested_layers):
         exp_time = bottom_exp if i < actual_bottom_layers else normal_exp
         config_ini += f"""
 [layer_{i}]
@@ -364,7 +379,7 @@ printer_technology = SLA
         # bytes for every single layer: this avoids needless CPU work that
         # scales with layer count and sidesteps double-compression quirks
         # some SL1 parsers have with re-deflated PNG streams.
-        for i in range(num_layers):
+        for i in range(requested_layers):
             info = zipfile.ZipInfo(f"slice_{i:06d}.png")
             info.compress_type = zipfile.ZIP_STORED
             zf.writestr(info, png_data)
@@ -372,8 +387,37 @@ printer_technology = SLA
         zf.writestr("prusaslicer.ini", prusaslicer_ini)
 
 
+def validate_sl1_layer_count(sl1_path: str, expected_layers: int) -> tuple:
+    """Validate the physical SL1 layer entries and config layer counts."""
+    with zipfile.ZipFile(sl1_path, "r") as zf:
+        slice_names = [
+            name for name in zf.namelist()
+            if name.lower().startswith("slice_") and name.lower().endswith(".png")
+        ]
+        config = zf.read("config.ini").decode("utf-8", errors="replace")
+
+    fast_match = re.search(r"^\s*num_fast\s*=\s*(\d+)\s*$", config, re.MULTILINE)
+    slow_match = re.search(r"^\s*num_slow\s*=\s*(\d+)\s*$", config, re.MULTILINE)
+    if not fast_match or not slow_match:
+        raise RuntimeError("Generated SL1 is missing num_fast or num_slow in config.ini.")
+
+    num_fast = int(fast_match.group(1))
+    num_slow = int(slow_match.group(1))
+    config_total = num_fast + num_slow
+    slice_total = len(slice_names)
+
+    if slice_total != expected_layers or config_total != expected_layers:
+        raise RuntimeError(
+            f"SL1 layer-count mismatch: requested={expected_layers}, "
+            f"slice_entries={slice_total}, config_total={config_total} "
+            f"(num_fast={num_fast}, num_slow={num_slow})."
+        )
+
+    return slice_total, num_fast, num_slow
+
+
 def convert_with_uvtools(uvtools_exe: str, sl1_path: str, out_path: str, fmt: str) -> None:
-    """Convert an SL1 file to the target format using the UVtools CLI."""
+    """Convert an SL1 file to the target resin-printer format using UVtools."""
     target_type = FORMAT_TO_UVTOOLS_ENCODER.get(fmt.upper())
     if target_type is None:
         raise RuntimeError(f"No UVtools target type mapped for format '{fmt}'")
@@ -397,6 +441,131 @@ def convert_with_uvtools(uvtools_exe: str, sl1_path: str, out_path: str, fmt: st
             f"{result.stderr}\n\nSTDOUT:\n{result.stdout}"
         )
 
+def export_stl_from_image(image: Image.Image, out_stl: str, width_mm: float,
+                          height_mm: float, max_height_mm: float,
+                          max_nodes: int = 512, base_thickness_mm: float = 0.0,
+                          invert: bool = False) -> None:
+    """Build a binary STL heightmap with the bottom layers as the solid base.
+
+    The grayscale value of each sampled image node controls the height above
+    the base: black starts at base_thickness_mm and white reaches
+    max_height_mm, which is the total STL height. The image aspect ratio and
+    requested physical XY dimensions are preserved. The base is flat from
+    Z=0 to base_thickness_mm, then the grayscale heightmap occupies the
+    remaining Z range.
+
+    The sampling and height mapping intentionally follow the image_to_stl.py
+    reference workflow: direct pixel sampling without interpolation and a
+    configurable cap on the largest grid dimension.
+    """
+    if width_mm <= 0 or height_mm <= 0 or max_height_mm <= 0:
+        raise ValueError("STL export requires positive physical dimensions and height.")
+    if max_nodes < 2:
+        raise ValueError("STL export requires at least two grid nodes per axis.")
+    if base_thickness_mm < 0 or base_thickness_mm > max_height_mm:
+        raise ValueError("STL base thickness must be between 0 and the total STL height.")
+
+    gray = np.asarray(image.convert("L"), dtype=np.float64)
+    src_rows, src_cols = gray.shape
+    if src_rows < 2 or src_cols < 2:
+        raise ValueError("STL export image is too small to build a heightmap.")
+
+    # Match image_to_stl.py: sample every Nth source pixel directly, without
+    # interpolation, so grayscale values remain literal heightmap samples.
+    step = max(1, int(np.ceil(max(src_rows, src_cols) / max_nodes)))
+    heightmap = gray[::step, ::step] / 255.0
+    if invert:
+        heightmap = 1.0 - heightmap
+
+    rows, cols = heightmap.shape
+    # Ensure the far edge of the source image is represented when direct
+    # stepping does not land exactly on the final source row/column.
+    row_indices = np.arange(0, src_rows, step, dtype=int)
+    col_indices = np.arange(0, src_cols, step, dtype=int)
+    if row_indices[-1] != src_rows - 1:
+        row_indices = np.append(row_indices, src_rows - 1)
+    if col_indices[-1] != src_cols - 1:
+        col_indices = np.append(col_indices, src_cols - 1)
+    heightmap = gray[np.ix_(row_indices, col_indices)] / 255.0
+    if invert:
+        heightmap = 1.0 - heightmap
+    rows, cols = heightmap.shape
+
+    x = np.linspace(0.0, width_mm, cols)
+    y = np.linspace(height_mm, 0.0, rows)
+    xx, yy = np.meshgrid(x, y)
+    relief_height_mm = max(0.0, max_height_mm - base_thickness_mm)
+    zz = base_thickness_mm + (heightmap * relief_height_mm)
+
+    top_vertices = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
+    n_top = len(top_vertices)
+    grid = np.arange(n_top, dtype=np.int64).reshape(rows, cols)
+
+    # Top surface: two triangles per heightmap cell.
+    v00 = grid[:-1, :-1].ravel()
+    v01 = grid[:-1, 1:].ravel()
+    v10 = grid[1:, :-1].ravel()
+    v11 = grid[1:, 1:].ravel()
+    top_faces = np.concatenate([
+        np.stack([v00, v10, v01], axis=1),
+        np.stack([v01, v10, v11], axis=1),
+    ], axis=0)
+
+    # The bottom layer stack is the actual STL base. Keep its lower face at
+    # Z=0 so the total STL height remains exactly max_height_mm.
+    bottom_vertices = top_vertices.copy()
+    bottom_vertices[:, 2] = 0.0
+    bottom_faces = top_faces[:, ::-1] + n_top
+
+    border = []
+    border.extend((0, c) for c in range(cols))
+    border.extend((r, cols - 1) for r in range(1, rows))
+    border.extend((rows - 1, c) for c in range(cols - 2, -1, -1))
+    border.extend((r, 0) for r in range(rows - 2, 0, -1))
+    border_idx = np.array([r * cols + c for r, c in border], dtype=np.int64)
+    bottom_border_idx = border_idx + n_top
+
+    wall_faces = []
+    for i in range(len(border_idx)):
+        j = (i + 1) % len(border_idx)
+        t0, t1 = int(border_idx[i]), int(border_idx[j])
+        b0, b1 = int(bottom_border_idx[i]), int(bottom_border_idx[j])
+        wall_faces.append([t0, t1, b0])
+        wall_faces.append([t1, b1, b0])
+
+    all_vertices = np.concatenate([top_vertices, bottom_vertices], axis=0)
+    all_faces = np.concatenate([
+        top_faces,
+        bottom_faces,
+        np.asarray(wall_faces, dtype=np.int64),
+    ], axis=0)
+
+    tri_vertices = all_vertices[all_faces]
+    edge1 = tri_vertices[:, 1] - tri_vertices[:, 0]
+    edge2 = tri_vertices[:, 2] - tri_vertices[:, 0]
+    normals = np.cross(edge1, edge2)
+    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+    safe_lengths = np.where(lengths == 0, 1.0, lengths)
+    normals = normals / safe_lengths
+
+    record_dtype = np.dtype([
+        ("normal", "<f4", 3),
+        ("vertices", "<f4", (3, 3)),
+        ("attr", "<u2"),
+    ])
+    records = np.zeros(len(all_faces), dtype=record_dtype)
+    records["normal"] = normals
+    records["vertices"] = tri_vertices
+
+    header = b"PDF2Resin heightmap STL".ljust(80, b" ")
+    with open(out_stl, "wb") as f:
+        f.write(header)
+        f.write(struct.pack("<I", len(all_faces)))
+        f.write(records.tobytes())
+
+    output_file = Path(out_stl)
+    if output_file.stat().st_size <= 84:
+        raise RuntimeError("Internal STL exporter produced an empty mesh.")
 
 
 class CropPreviewLabel(QLabel):
@@ -919,6 +1088,12 @@ class PDF2ResinGUI(QMainWindow):
         self.bottom_layers_spin = QSpinBox(); self.bottom_layers_spin.setRange(0, 50); self.bottom_layers_spin.setValue(int(self.settings.value("bottom_layers", 5)))
         self.num_layers_spin = QSpinBox(); self.num_layers_spin.setRange(1, 200); self.num_layers_spin.setValue(int(self.settings.value("num_layers", 10)))
 
+        # Bottom layers are a subset of total layers and must never create an
+        # additional layer group. Keep the control range synchronized with
+        # the selected total layer count.
+        self.bottom_layers_spin.setMaximum(self.num_layers_spin.value())
+        self.num_layers_spin.valueChanged.connect(self.on_total_layers_changed)
+
         exp_layout.addRow("Layer Height:", self.layer_height_spin)
         exp_layout.addRow("Normal Exp:", self.normal_exp_spin)
         exp_layout.addRow("Bottom Exp:", self.bottom_exp_spin)
@@ -931,7 +1106,7 @@ class PDF2ResinGUI(QMainWindow):
         fmt_group = QGroupBox("Output Format")
         fmt_layout = QFormLayout()
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["SL1", "CTB", "PHOTON", "GOO", "CBDDLP", "PHZ"])
+        self.format_combo.addItems(["SL1", "CTB", "PHOTON", "GOO", "CBDDLP", "PHZ", "STL"])
         fmt_layout.addRow("Format:", self.format_combo)
         # Warn the user if the selected format does not match the preset's
         # recommended format (still allowed, since it may be intentional).
@@ -1064,7 +1239,7 @@ class PDF2ResinGUI(QMainWindow):
                 self.crop_box = None
         self.preview_label.set_crop_enabled(self.crop_check.isChecked())
 
-        self.log("PDF2Resin v1.3.4 started.")
+        self.log("PDF2Resin v1.3.11 started.")
 
         # Auto-size the window tall enough to show every control, including
         # the log panel, without the right-hand panel needing to scroll.
@@ -1205,6 +1380,9 @@ class PDF2ResinGUI(QMainWindow):
         """Warn the user if the selected format does not match the current printer preset."""
         current_preset = self.preset_combo.currentText()
         recommended = PRESET_FORMAT_MAP.get(current_preset, "SL1").strip()
+        if new_format.upper() == "STL":
+            self.format_combo.setStyleSheet("")
+            return
         if new_format != recommended and current_preset != "Custom":
             self.format_combo.setStyleSheet(
                 "QComboBox { border: 2px solid #ff9900; background: #fff3cd; }"
@@ -1709,7 +1887,7 @@ class PDF2ResinGUI(QMainWindow):
         if self.crop_check.isChecked() and size:
             parts.append(f"crop{size[0]}x{size[1]}")
 
-        if preset_slug:
+        if preset_slug and self.format_combo.currentText().upper() != "STL":
             parts.append(preset_slug)
 
         # Add only non-default transformations so the name stays readable.
@@ -1738,17 +1916,20 @@ class PDF2ResinGUI(QMainWindow):
         if not self.convert_btn.isEnabled() or not self.original_image:
             return
 
+        fmt = self.format_combo.currentText().upper()
         default_name = self._build_export_filename()
         default_dir = str(Path(self.pdf_path).parent / default_name)
-        out_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Printer File", default_dir,
+        save_title = "Save 3D Mesh" if fmt == "STL" else "Save Printer File"
+        save_filter = "STL Mesh (*.stl)" if fmt == "STL" else (
             f"{self.format_combo.currentText()} Files (*.{self.format_combo.currentText().lower()})"
+        )
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, save_title, default_dir, save_filter
         )
         if not out_path:
             return
 
         # Bug #5 Fix: Ensure the output path has the correct extension
-        fmt = self.format_combo.currentText().upper()
         expected_ext = f".{fmt.lower()}"
         if not out_path.lower().endswith(expected_ext):
             out_path += expected_ext
@@ -1894,16 +2075,66 @@ class PDF2ResinGUI(QMainWindow):
 
             sl1_target = out_path if fmt == "SL1" else str(tmp_sl1)
 
+            requested_layers = self.num_layers_spin.value()
+            requested_bottom_layers = min(self.bottom_layers_spin.value(), requested_layers)
+            requested_normal_layers = requested_layers - requested_bottom_layers
+            self.log(
+                f"Layer plan: total={requested_layers}, bottom={requested_bottom_layers}, "
+                f"normal={requested_normal_layers}, expected total="
+                f"{requested_bottom_layers + requested_normal_layers}."
+            )
+
             build_sl1(
                 str(tmp_png), sl1_target, target_w_px, target_h_px,
                 res_x, res_y, disp_w, disp_h,
                 self.layer_height_spin.value(), self.normal_exp_spin.value(), 
                 self.bottom_exp_spin.value(), self.bottom_layers_spin.value(),
-                self.num_layers_spin.value()
+                requested_layers
             )
-            self.log(f"SL1 built: {target_w_px}x{target_h_px}px, {self.num_layers_spin.value()} layers.")
+            self.log(
+                f"SL1 built: {target_w_px}x{target_h_px}px, "
+                f"{requested_layers} layer entries ({requested_bottom_layers} bottom + "
+                f"{requested_normal_layers} normal)."
+            )
+            slice_total, config_fast, config_slow = validate_sl1_layer_count(
+                str(sl1_target), requested_layers
+            )
+            self.log(
+                f"SL1 layer-count verified: {slice_total} slices, "
+                f"num_fast={config_fast}, num_slow={config_slow}, "
+                f"total={config_fast + config_slow}."
+            )
 
-            if fmt != "SL1":
+            if fmt == "STL":
+                # STL uses the final raster as a grayscale heightmap. Black
+                # maps to zero surface height, white maps to the full height
+                # represented by the selected resin layer stack, and all
+                # intermediate grayscale values become proportional Z levels.
+                # Use one physical pixel pitch for both axes. Resin LCD pixels are
+                # treated as square, matching the image_to_stl.py reference behavior.
+                pixel_pitch_mm = disp_w / res_x
+                physical_width_mm = target_w_px * pixel_pitch_mm
+                physical_height_mm = target_h_px * pixel_pitch_mm
+                max_height_mm = requested_layers * self.layer_height_spin.value()
+                base_thickness_mm = requested_bottom_layers * self.layer_height_spin.value()
+                self.log(
+                    f"Building internal STL heightmap: {target_w_px}x{target_h_px}px, "
+                    f"physical size {physical_width_mm:.3f}x{physical_height_mm:.3f} mm, "
+                    f"pixel pitch {pixel_pitch_mm:.6f} mm, "
+                    f"total height 0-{max_height_mm:.3f} mm, "
+                    f"bottom-layer base {base_thickness_mm:.3f} mm "
+                    f"({requested_bottom_layers} layers)."
+                )
+                export_stl_from_image(
+                    final_img, str(tmp_output),
+                    physical_width_mm, physical_height_mm,
+                    max_height_mm,
+                    max_nodes=512,
+                    base_thickness_mm=base_thickness_mm,
+                    invert=False
+                )
+                os.replace(tmp_output, out_path)
+            elif fmt != "SL1":
                 uvtools_exe = self.uvtools_path.text()
                 if not uvtools_exe or not Path(uvtools_exe).exists():
                     auto_path = find_executable("UVtoolsCmd", r"SOFTWARE\UVtools")
@@ -1940,6 +2171,12 @@ class PDF2ResinGUI(QMainWindow):
             self.convert_btn.setEnabled(True)
             self.convert_btn.setText("Generate & Export")
             self.load_pdf_btn.setEnabled(True)
+
+    def on_total_layers_changed(self, value):
+        """Keep bottom-layer count within the selected total layer count."""
+        self.bottom_layers_spin.setMaximum(max(0, int(value)))
+        if self.bottom_layers_spin.value() > value:
+            self.bottom_layers_spin.setValue(value)
 
     def closeEvent(self, event):
         # Persist every user-configurable setting
