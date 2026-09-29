@@ -137,6 +137,7 @@ printing or further processing in a conventional slicer.
 > map.
 
 ![UVtools conversion, monoscope](screenshots/uvtools_monoscope.jpg)
+![UVtools conversion, monoscope](screenshots/uvtools_monoscope_3D.jpg)
 
 ---
 
